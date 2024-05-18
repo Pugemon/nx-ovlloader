@@ -1,5 +1,4 @@
 #include <switch.h>
-
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -252,7 +251,10 @@ void loadNro(void)
         }
     }
 
-    // todo: Detect whether NRO fits into heap or not.
+    // Detect whether NRO fits into heap or not.
+    if (total_size > g_heapSize) {
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 2));
+    }
 
     // Copy header to elsewhere because we're going to unmap it next.
     memcpy(&g_nroHeader, header, sizeof(g_nroHeader));
@@ -338,7 +340,7 @@ void loadNro(void)
 
     memset(__stack_top - STACK_SIZE, 0, STACK_SIZE);
 
-    extern NORETURN void nroEntrypointTrampoline(u64 entries_ptr, u64 handle, u64 entrypoint);
+    extern NX_NORETURN void nroEntrypointTrampoline(u64 entries_ptr, u64 handle, u64 entrypoint);
     nroEntrypointTrampoline((u64) entries, -1, entrypoint);
 }
 
