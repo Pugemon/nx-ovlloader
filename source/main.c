@@ -1,14 +1,16 @@
 #include <switch.h>
+#include <switch/result.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
 
 #define DEFAULT_NRO "sdmc:/switch/.overlays/ovlmenu.ovl"
+#define STACK_SIZE 0x10000 // Change this if main-thread stack size ever changes.
+#define INNER_HEAP_SIZE 0x4000
 
 const char g_noticeText[] =
-    "nx-ovlloader " VERSION "\0"
-    "What's the most resilient parasite? A bacteria? A virus? An intestinal worm? An idea. Resilient, highly contagious.";
+        "nx-ovlloader " VERSION "\0"
+"What's the most resilient parasite? A bacteria? A virus? An intestinal worm? An idea. Resilient, highly contagious.";
 
 static char g_argv[2048];
 static char g_nextArgv[2048];
@@ -19,9 +21,7 @@ static NroHeader g_nroHeader;
 
 static u64 g_appletHeapSize = 0;
 static u64 g_appletHeapReservationSize = 0;
-
 static u128 g_userIdStorage;
-
 static u8 g_savedTls[0x100];
 
 // Minimize fs resource usage
@@ -33,17 +33,16 @@ bool __nx_fsdev_support_cwd = false;
 Result g_lastRet = 0;
 
 extern void* __stack_top; // Defined in libnx.
-#define STACK_SIZE 0x10000 // Change this if main-thread stack size ever changes.
 
 void __libnx_initheap(void)
 {
-    static char g_innerheap[0x4000];
+    static char g_innerheap[INNER_HEAP_SIZE];
 
     extern char* fake_heap_start;
     extern char* fake_heap_end;
 
-    fake_heap_start = &g_innerheap[0];
-    fake_heap_end   = &g_innerheap[sizeof g_innerheap];
+    fake_heap_start = g_innerheap;
+    fake_heap_end   = g_innerheap + sizeof(g_innerheap);
 }
 
 void __appInit(void)
@@ -137,7 +136,7 @@ static void getOwnProcessHandle(void)
         fatalThrow(MAKERESULT(Module_HomebrewLoader, 13));
 
     hipcMakeRequestInline(armGetTls(),
-        .num_copy_handles = 1,
+            .num_copy_handles = 1,
     ).copy_handles[0] = CUR_PROCESS_HANDLE;
 
     svcSendSyncRequest(client_handle);
@@ -147,67 +146,105 @@ static void getOwnProcessHandle(void)
     threadClose(&t);
 }
 
+static void unmapPreviousNro(NroHeader* header)
+{
+    size_t rw_size = header->segments[2].size + header->bss_size;
+    rw_size = (rw_size + 0xFFF) & ~0xFFF;
+
+    // .text
+    Result rc = svcUnmapProcessCodeMemory(
+            g_procHandle, g_nroAddr + header->segments[0].file_off, ((u64) g_heapAddr) + header->segments[0].file_off, header->segments[0].size);
+    if (R_FAILED(rc))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 24));
+
+    // .rodata
+    rc = svcUnmapProcessCodeMemory(
+            g_procHandle, g_nroAddr + header->segments[1].file_off, ((u64) g_heapAddr) + header->segments[1].file_off, header->segments[1].size);
+    if (R_FAILED(rc))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 25));
+
+    // .data + .bss
+    rc = svcUnmapProcessCodeMemory(
+            g_procHandle, g_nroAddr + header->segments[2].file_off, ((u64) g_heapAddr) + header->segments[2].file_off, rw_size);
+    if (R_FAILED(rc))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 26));
+
+    g_nroAddr = g_nroSize = 0;
+}
+
+static void loadNroFromFile(FsFile* fd, NroStart* start, NroHeader* header, uint8_t* rest, size_t rest_size)
+{
+    s64 offset = 0;
+    u64 bytes_read;
+
+    if (R_FAILED(fsFileRead(fd, offset, start, sizeof(*start), FsReadOption_None, &bytes_read)) || bytes_read != sizeof(*start))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 4));
+    offset += sizeof(*start);
+
+    if (R_FAILED(fsFileRead(fd, offset, header, sizeof(*header), FsReadOption_None, &bytes_read)) || bytes_read != sizeof(*header))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 4));
+    offset += sizeof(*header);
+
+    if (header->magic != NROHEADER_MAGIC)
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 5));
+
+    if (R_FAILED(fsFileRead(fd, offset, rest, rest_size, FsReadOption_None, &bytes_read)) || bytes_read != rest_size)
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 7));
+}
+
+static void mapNro(u64 map_addr, NroHeader* header, size_t rw_size)
+{
+    // .text
+    Result rc = svcSetProcessMemoryPermission(
+            g_procHandle, map_addr + header->segments[0].file_off, header->segments[0].size, Perm_R | Perm_X);
+    if (R_FAILED(rc))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 19));
+
+    // .rodata
+    rc = svcSetProcessMemoryPermission(
+            g_procHandle, map_addr + header->segments[1].file_off, header->segments[1].size, Perm_R);
+    if (R_FAILED(rc))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 20));
+
+    // .data + .bss
+    rc = svcSetProcessMemoryPermission(
+            g_procHandle, map_addr + header->segments[2].file_off, rw_size, Perm_Rw);
+    if (R_FAILED(rc))
+        fatalThrow(MAKERESULT(Module_HomebrewLoader, 21));
+}
+
 void loadNro(void)
 {
     NroHeader* header = NULL;
-    size_t rw_size=0;
-    Result rc=0;
+    size_t rw_size = 0;
+    Result rc = 0;
 
     memcpy((u8*)armGetTls() + 0x100, g_savedTls, 0x100);
 
-    if (g_nroSize > 0)
-    {
-        // Unmap previous NRO.
-        header = &g_nroHeader;
-        rw_size = header->segments[2].size + header->bss_size;
-        rw_size = (rw_size+0xFFF) & ~0xFFF;
-
-        // .text
-        rc = svcUnmapProcessCodeMemory(
-            g_procHandle, g_nroAddr + header->segments[0].file_off, ((u64) g_heapAddr) + header->segments[0].file_off, header->segments[0].size);
-
-        if (R_FAILED(rc))
-            fatalThrow(MAKERESULT(Module_HomebrewLoader, 24));
-
-        // .rodata
-        rc = svcUnmapProcessCodeMemory(
-            g_procHandle, g_nroAddr + header->segments[1].file_off, ((u64) g_heapAddr) + header->segments[1].file_off, header->segments[1].size);
-
-        if (R_FAILED(rc))
-            fatalThrow(MAKERESULT(Module_HomebrewLoader, 25));
-
-        // .data + .bss
-        rc = svcUnmapProcessCodeMemory(
-            g_procHandle, g_nroAddr + header->segments[2].file_off, ((u64) g_heapAddr) + header->segments[2].file_off, rw_size);
-
-        if (R_FAILED(rc))
-            fatalThrow(MAKERESULT(Module_HomebrewLoader, 26));
-
-        g_nroAddr = g_nroSize = 0;
+    if (g_nroSize > 0) {
+        unmapPreviousNro(&g_nroHeader);
     }
 
     if (g_nextNroPath[0] == '\0')
         memcpy(g_nextNroPath, DEFAULT_NRO, sizeof(DEFAULT_NRO));
 
     if (g_nextArgv[0] == '\0')
-        memcpy(g_nextArgv,    DEFAULT_NRO, sizeof(DEFAULT_NRO));
+        memcpy(g_nextArgv, DEFAULT_NRO, sizeof(DEFAULT_NRO));
 
-    memcpy(g_argv, g_nextArgv, sizeof g_argv);
+    memcpy(g_argv, g_nextArgv, sizeof(g_argv));
 
-    uint8_t *nrobuf = (uint8_t*) g_heapAddr;
+    uint8_t* nrobuf = (uint8_t*)g_heapAddr;
 
-    NroStart*  start  = (NroStart*)  (nrobuf + 0);
-    header = (NroHeader*) (nrobuf + sizeof(NroStart));
-    uint8_t*   rest   = (uint8_t*)   (nrobuf + sizeof(NroStart) + sizeof(NroHeader));
-    
+    NroStart* start = (NroStart*)(nrobuf);
+    header = (NroHeader*)(nrobuf + sizeof(NroStart));
+    uint8_t* rest = (uint8_t*)(nrobuf + sizeof(NroStart) + sizeof(NroHeader));
+
     FsFileSystem sdmc;
-    rc = fsOpenSdCardFileSystem(&sdmc);
-    if (R_FAILED(rc))
+    if (R_FAILED(fsOpenSdCardFileSystem(&sdmc)))
         fatalThrow(MAKERESULT(Module_HomebrewLoader, 404));
 
     FsFile fd;
-    rc = fsFsOpenFile(&sdmc, g_nextNroPath + 5, FsOpenMode_Read, &fd);
-    if (R_FAILED(rc)) {
+    if (R_FAILED(fsFsOpenFile(&sdmc, g_nextNroPath + 5, FsOpenMode_Read, &fd))) {
         fsFsClose(&sdmc);
         exit(1);
     }
@@ -215,35 +252,18 @@ void loadNro(void)
     // Reset NRO path to load hbmenu by default next time.
     g_nextNroPath[0] = '\0';
 
-    s64 offset=0;
-    u64 bytes_read;
-    if (R_FAILED(fsFileRead(&fd, offset, start, sizeof(*start), FsReadOption_None, &bytes_read)) || bytes_read != sizeof(*start))
-        fatalThrow(MAKERESULT(Module_HomebrewLoader, 4));
-    offset+=sizeof(*start);
-
-    if (R_FAILED(fsFileRead(&fd, offset, header, sizeof(*header), FsReadOption_None, &bytes_read)) || bytes_read != sizeof(*header))
-        fatalThrow(MAKERESULT(Module_HomebrewLoader, 4));
-    offset+=sizeof(*header);
-
-    if (header->magic != NROHEADER_MAGIC)
-        fatalThrow(MAKERESULT(Module_HomebrewLoader, 5));
-
-    size_t rest_size = header->size - (sizeof(NroStart) + sizeof(NroHeader));
-    if (R_FAILED(fsFileRead(&fd, offset, rest, rest_size, FsReadOption_None, &bytes_read)) || bytes_read != rest_size)
-        fatalThrow(MAKERESULT(Module_HomebrewLoader, 7));
+    loadNroFromFile(&fd, start, header, rest, header->size - (sizeof(NroStart) + sizeof(NroHeader)));
 
     fsFileClose(&fd);
     fsFsClose(&sdmc);
 
     size_t total_size = header->size + header->bss_size;
-    total_size = (total_size+0xFFF) & ~0xFFF;
+    total_size = (total_size + 0xFFF) & ~0xFFF;
 
     rw_size = header->segments[2].size + header->bss_size;
-    rw_size = (rw_size+0xFFF) & ~0xFFF;
+    rw_size = (rw_size + 0xFFF) & ~0xFFF;
 
-    int i;
-    for (i=0; i<3; i++)
-    {
+    for (int i = 0; i < 3; i++) {
         if (header->segments[i].file_off >= header->size || header->segments[i].size > header->size ||
             (header->segments[i].file_off + header->segments[i].size) > header->size)
         {
@@ -261,56 +281,35 @@ void loadNro(void)
     header = &g_nroHeader;
 
     u64 map_addr;
-
     do {
         map_addr = randomGet64() & 0xFFFFFF000ull;
         rc = svcMapProcessCodeMemory(g_procHandle, map_addr, (u64)nrobuf, total_size);
-
     } while (rc == 0xDC01 || rc == 0xD401);
 
     if (R_FAILED(rc))
         fatalThrow(MAKERESULT(Module_HomebrewLoader, 18));
 
-    // .text
-    rc = svcSetProcessMemoryPermission(
-        g_procHandle, map_addr + header->segments[0].file_off, header->segments[0].size, Perm_R | Perm_X);
-
-    if (R_FAILED(rc))
-        fatalThrow(MAKERESULT(Module_HomebrewLoader, 19));
-
-    // .rodata
-    rc = svcSetProcessMemoryPermission(
-        g_procHandle, map_addr + header->segments[1].file_off, header->segments[1].size, Perm_R);
-
-    if (R_FAILED(rc))
-        fatalThrow(MAKERESULT(Module_HomebrewLoader, 20));
-
-    // .data + .bss
-    rc = svcSetProcessMemoryPermission(
-        g_procHandle, map_addr + header->segments[2].file_off, rw_size, Perm_Rw);
-
-    if (R_FAILED(rc))
-        fatalThrow(MAKERESULT(Module_HomebrewLoader, 21));
+    mapNro(map_addr, header, rw_size);
 
     u64 nro_size = header->segments[2].file_off + rw_size;
-    u64 nro_heap_start = ((u64) g_heapAddr) + nro_size;
-    u64 nro_heap_size  = g_heapSize + (u64) g_heapAddr - (u64) nro_heap_start;
+    u64 nro_heap_start = ((u64)g_heapAddr) + nro_size;
+    u64 nro_heap_size = g_heapSize + (u64)g_heapAddr - (u64)nro_heap_start;
 
-    #define M EntryFlag_IsMandatory
+#define M EntryFlag_IsMandatory
 
     static ConfigEntry entries[] = {
-        { EntryType_MainThreadHandle,     0, {0, 0} },
-        { EntryType_ProcessHandle,        0, {0, 0} },
-        { EntryType_AppletType,           0, {AppletType_LibraryApplet, 0} },
-        { EntryType_OverrideHeap,         M, {0, 0} },
-        { EntryType_Argv,                 0, {0, 0} },
-        { EntryType_NextLoadPath,         0, {0, 0} },
-        { EntryType_LastLoadResult,       0, {0, 0} },
-        { EntryType_SyscallAvailableHint, 0, {0xffffffffffffffff, 0x9fc1fff0007ffff} },
-        { EntryType_RandomSeed,           0, {0, 0} },
-        { EntryType_UserIdStorage,        0, {(u64)(uintptr_t)&g_userIdStorage, 0} },
-        { EntryType_HosVersion,           0, {0, 0} },
-        { EntryType_EndOfList,            0, {(u64)(uintptr_t)g_noticeText, sizeof(g_noticeText)} }
+            { EntryType_MainThreadHandle,     0, {0, 0} },
+            { EntryType_ProcessHandle,        0, {0, 0} },
+            { EntryType_AppletType,           0, {AppletType_LibraryApplet, 0} },
+            { EntryType_OverrideHeap,         M, {0, 0} },
+            { EntryType_Argv,                 0, {0, 0} },
+            { EntryType_NextLoadPath,         0, {0, 0} },
+            { EntryType_LastLoadResult,       0, {0, 0} },
+            { EntryType_SyscallAvailableHint, 0, {0xffffffffffffffff, 0x9fc1fff0007ffff} },
+            { EntryType_RandomSeed,           0, {0, 0} },
+            { EntryType_UserIdStorage,        0, {(u64)(uintptr_t)&g_userIdStorage, 0} },
+            { EntryType_HosVersion,           0, {0, 0} },
+            { EntryType_EndOfList,            0, {(u64)(uintptr_t)g_noticeText, sizeof(g_noticeText)} }
     };
 
     // MainThreadHandle
@@ -341,12 +340,12 @@ void loadNro(void)
     memset(__stack_top - STACK_SIZE, 0, STACK_SIZE);
 
     extern NX_NORETURN void nroEntrypointTrampoline(u64 entries_ptr, u64 handle, u64 entrypoint);
-    nroEntrypointTrampoline((u64) entries, -1, entrypoint);
+    nroEntrypointTrampoline((u64)entries, -1, entrypoint);
 }
 
 int main(int argc, char **argv)
 {
-    if (hosversionBefore(9,0,0))
+    if (hosversionBefore(9, 0, 0))
         exit(1);
 
     memcpy(g_savedTls, (u8*)armGetTls() + 0x100, 0x100);
